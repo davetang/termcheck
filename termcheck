@@ -1,0 +1,906 @@
+#!/usr/bin/env bash
+# termcheck: check what a shell here can send to the terminal you are sitting
+# at, over SSH and mosh, and through tmux and GNU screen:
+#
+#   clipboard copies   OSC 52
+#   notifications      OSC 9, OSC 777, kitty's OSC 99
+#   images             kitty graphics protocol, iTerm2 inline images, sixel
+#   links              OSC 8
+#   24-bit colour
+#
+# It asks your terminal what it is, wrapping the questions so that tmux and
+# screen pass them on, reads tmux's and screen's settings, and checks the
+# terminfo entry for $TERM. Then it says, for each feature, whether it gets
+# through, and what to change where it doesn't.
+
+# SC1003: the backslashes in escape sequences are meant. SC2088: so are the
+# tildes, in text that tells you what to run
+# shellcheck disable=SC1003,SC2088
+set -euo pipefail
+
+usage() {
+  cat <<'EOF'
+Usage: termcheck [-t] [-v]
+
+Check what this shell can send to the terminal you're sitting at, over SSH
+and mosh, and through tmux and GNU screen: clipboard copies (OSC 52),
+notifications, images, links (OSC 8) and 24-bit colour. Says what to change
+where something doesn't get through.
+
+  -t   also send a test of each feature, to see which ones arrive. This
+       copies a line of text to your clipboard
+  -v   also show your terminal's answers, as they arrived
+  -h   show this help
+
+Exit status: 0 if nothing needs changing, 1 if something does, 2 for a usage
+error.
+EOF
+}
+
+warn() { echo "termcheck: $*" >&2; }
+
+have() { command -v "$1" > /dev/null; }
+
+# true if version $1 is $2.$3 or later. One without a number, such as tmux's
+# "master", counts as new
+at_least() {
+  local major minor
+  [[ $1 =~ ([0-9]+)\.([0-9]+) ]] || return 0
+  major=$((10#${BASH_REMATCH[1]}))
+  minor=$((10#${BASH_REMATCH[2]}))
+  (( major > $2 || (major == $2 && minor >= $3) ))
+}
+
+# process $1 and the processes above it, as "PID NAME" lines, from /proc
+ancestry() {
+  local pid=$1 stat name n=0
+  while [[ $pid =~ ^[0-9]+$ ]] && (( pid > 1 && n < 50 )); do
+    stat=$(cat "/proc/$pid/stat" 2> /dev/null) || return 0
+    # the name is in brackets and may hold spaces ("tmux: server")
+    name=${stat#*(}
+    printf '%s %s\n' "$pid" "${name%)*}"
+    read -r _ pid _ <<< "${stat##*) }"
+    n=$((n + 1))
+  done
+}
+
+# how process $1 is connected to you: "ssh", "mosh PID" or "local", from the
+# processes above it; nothing where there's no /proc to look in
+link_of() {
+  local pid name procs
+  [[ -r /proc/$1/stat ]] || return 0
+  # all of them first: leaving a pipe early makes ancestry complain
+  procs=$(ancestry "$1")
+  while read -r pid name; do
+    case $name in
+      # sshd-session: OpenSSH 9.8 and later
+      sshd|sshd-session) echo ssh; return ;;
+      mosh-server)       echo "mosh $pid"; return ;;
+    esac
+  done <<< "$procs"
+  echo local
+}
+
+# the innermost of tmux and screen above process $1, or nothing
+mux_above() {
+  local pid name procs
+  procs=$(ancestry "$1")
+  while read -r pid name; do
+    case $name in
+      'tmux: server') echo tmux; return ;;
+      screen|SCREEN)  echo screen; return ;;
+    esac
+  done <<< "$procs"
+}
+
+# GNU screen passes DCS strings (ESC P ... ESC \) on untouched. An ESC \
+# inside would end one early, so end the DCS after the ESC and start the
+# next one with the backslash. termcheck's sequences are short, well under
+# the 760 bytes or so at which screen drops a DCS
+for_screen() {
+  local s=$1
+  while [[ $s == *$'\e\\'* ]]; do
+    printf '\eP%s\e\e\\' "${s%%$'\e\\'*}"
+    s=\\${s#*$'\e\\'}
+  done
+  if [[ -n $s ]]; then
+    printf '\eP%s\e\\' "$s"
+  fi
+}
+
+# $1, wrapped so that tmux or screen passes it to your terminal untouched
+wrap() {
+  case $mux in
+    # tmux passthrough: ESC Ptmux; ... ESC \, with each ESC inside doubled
+    tmux)   printf '\ePtmux;%s\e\\' "${1//$'\e'/$'\e\e'}" ;;
+    screen) for_screen "$1" ;;
+    *)      printf '%s' "$1" ;;
+  esac
+}
+
+# ask the terminal whether it shows kitty images and kitty notifications, its
+# name (XTVERSION) and its size in pixels. DA1 goes last: every terminal
+# answers it, so its answer marks the end of the answers
+ask_terminal() {
+  local c reply='' re
+  tty_state=$(stty -g < /dev/tty 2> /dev/null) || return 0
+  stty -echo -icanon < /dev/tty
+  wrap $'\e_Gi=31,s=1,v=1,a=q,t=d,f=24;AAAA\e\\\e]99;i=termcheck:p=?;\e\\\e[>0q\e[14t\e[c' >&3
+  asked=true
+  # a slow link can take a moment to answer; a terminal that never answers
+  # costs 2 seconds
+  re=$'\e''\[\?[0-9;]*c$'
+  while IFS= read -r -s -n 1 -d '' -t 2 c < /dev/tty; do
+    reply+=$c
+    [[ $reply =~ $re ]] && break
+  done
+  # answers that arrive late, such as a second terminal's in the same tmux
+  # session, would otherwise turn up as typed input
+  while IFS= read -r -s -n 1 -d '' -t 0.3 c < /dev/tty; do
+    reply+=$c
+  done
+  stty "$tty_state" < /dev/tty
+  tty_state=
+  answers=$reply
+
+  re=$'\eP>[|]([^\e]*)'
+  [[ $reply =~ $re ]] && xtversion=${BASH_REMATCH[1]}
+  [[ $reply == *$'\e_Gi=31;OK'* ]] && kitty_images=true
+  [[ $reply == *$'\e]99;i=termcheck:p=?;'* ]] && kitty_notify=true
+  re=$'\e''\[4;([0-9]+);([0-9]+)t'
+  if [[ $reply =~ $re ]]; then
+    pixels="${BASH_REMATCH[2]}x${BASH_REMATCH[1]}"
+  fi
+  re=$'\e''\[\?([0-9;]*)c'
+  if [[ $reply =~ $re ]]; then
+    da1=${BASH_REMATCH[1]}
+    # attribute 4 means sixel
+    [[ ";$da1;" == *';4;'* ]] && sixel=true
+  fi
+  return 0
+}
+
+# the terminal a name belongs to. Names: the answer to XTVERSION (also in
+# tmux's client_termtype, e.g. "Warp(v0.2026.05.06.15.42.stable_02)"),
+# $LC_TERMINAL, $TERM_PROGRAM or $TERM. Prints nothing for a name termcheck
+# doesn't know. Always called in $(...), so nocasematch doesn't leak
+terminal_of() {
+  shopt -s nocasematch
+  case $1 in
+    *warp*)                echo Warp ;;
+    *kitty*)               echo kitty ;;
+    *ghostty*)             echo Ghostty ;;
+    *iterm*)               echo iTerm2 ;;
+    *wezterm*)             echo WezTerm ;;
+    foot|foot-*|'foot('*)  echo foot ;;
+    *alacritty*)           echo Alacritty ;;
+    apple_terminal)        echo Terminal.app ;;
+    vte|vte-*|'vte('*)     echo VTE ;;
+  esac
+}
+
+# what a terminal supports, from its documentation (Warp's from its source
+# code). t_clip, t_link and t_rgb: yes, no or ?. t_notify: the notification
+# sequences it shows (9, 777, 99). t_images: the image protocols it shows.
+# t_setup: what to switch on in the terminal itself. t_clip_detail: what to
+# say where t_clip is ?
+known_terminal() {
+  t_setup='' t_clip_detail=''
+  case $1 in
+    Warp)
+      t_clip=yes t_notify='9 777' t_images=kitty t_link=yes t_rgb=yes
+      t_setup='for notifications, turn on Settings > Features > Notifications > "Receive desktop notifications"'
+      ;;
+    kitty)
+      t_clip=yes t_notify=99 t_images=kitty t_link=yes t_rgb=yes
+      ;;
+    Ghostty)
+      t_clip=yes t_notify='9 777' t_images=kitty t_link=yes t_rgb=yes
+      ;;
+    iTerm2)
+      t_clip=setting t_notify=9 t_images='iterm sixel' t_link=yes t_rgb=yes
+      t_setup='for clipboard copies, tick Settings > General > Selection > "Applications in terminal may access clipboard"; for notifications, see Settings > Profiles > Terminal'
+      ;;
+    WezTerm)
+      t_clip=yes t_notify='9 777' t_images='iterm sixel' t_link=yes t_rgb=yes
+      ;;
+    foot)
+      t_clip=yes t_notify=777 t_images=sixel t_link=yes t_rgb=yes
+      ;;
+    Alacritty)
+      t_clip=yes t_notify='' t_images='' t_link=yes t_rgb=yes
+      ;;
+    Terminal.app)
+      t_clip=no t_notify='' t_images='' t_link='?' t_rgb='?'
+      ;;
+    VTE)
+      t_clip=no t_notify='?' t_images='' t_link=yes t_rgb=yes
+      ;;
+    'PuTTY, KiTTY or MobaXterm')
+      # PuTTY takes no clipboard copies, and in testing neither did MobaXterm,
+      # but KiTTY does. PuTTY won't ever have links. MobaXterm printed the
+      # sixel test as text
+      t_clip='?' t_notify='' t_images='' t_link='?' t_rgb=yes
+      t_clip_detail="PuTTY and MobaXterm don't take them; KiTTY does"
+      ;;
+    *)
+      t_clip='?' t_notify='?' t_images='?' t_link='?' t_rgb='?'
+      ;;
+  esac
+}
+
+# the space-separated list $1 with word $2 added, once. A list that was "?"
+# (not known) becomes just $2
+with_word() {
+  local list=$1
+  [[ $list == '?' ]] && list=
+  if [[ " $list " == *" $2 "* ]]; then
+    printf '%s' "$list"
+  else
+    printf '%s' "${list:+$list }$2"
+  fi
+}
+
+# "9 777" -> "OSC 9, OSC 777"
+osc_list() {
+  local m out=
+  for m in $1; do
+    out="${out:+$out, }OSC $m"
+  done
+  printf '%s' "$out"
+}
+
+# kitty -> "kitty protocol"; "iterm sixel" -> "iTerm2 protocol, sixel"
+image_list() {
+  local p out=
+  for p in $1; do
+    case $p in
+      kitty) p='kitty protocol' ;;
+      iterm) p='iTerm2 protocol' ;;
+    esac
+    out="${out:+$out, }$p"
+  done
+  printf '%s' "$out"
+}
+
+# where the terminfo entry for $1 is, from the directories ncurses searches.
+# Prints nothing if there's none
+terminfo_file() {
+  local name=$1 dir hex d dirs=()
+  printf -v hex '%x' "'${name:0:1}"
+  [[ -n ${TERMINFO:-} ]] && dirs+=("$TERMINFO")
+  dirs+=("$HOME/.terminfo")
+  if [[ -n ${TERMINFO_DIRS:-} ]]; then
+    IFS=: read -ra d <<< "$TERMINFO_DIRS"
+    dirs+=("${d[@]}")
+  fi
+  dirs+=(/etc/terminfo /lib/terminfo /usr/share/terminfo /usr/lib/terminfo /usr/share/lib/terminfo)
+  for dir in "${dirs[@]}"; do
+    [[ -n $dir ]] || continue
+    for d in "$dir/${name:0:1}" "$dir/$hex"; do
+      if [[ -f $d/$name ]]; then
+        printf '%s\n' "$d/$name"
+        return
+      fi
+    done
+  done
+}
+
+# one row of the feature table
+row() {
+  local status=$2 detail=$3
+  if $tmux_unknown && [[ $status == ok || $status == fix ]]; then
+    status='?' detail="can't read tmux's settings: tmux isn't on PATH"
+  fi
+  printf '  %-15s %-6s %s\n' "$1" "$status" "$detail"
+  if [[ $status == fix ]]; then
+    need_fix=true
+  fi
+}
+
+# a line for ~/.tmux.conf, once
+tmux_fix() {
+  if ! $tmux_unknown && [[ " ${tmux_lines[*]-} " != *" $1 "* ]]; then
+    tmux_lines+=("$1")
+  fi
+}
+
+# a feature to tell tmux your terminal has, for one terminal-features line
+tmux_feature() {
+  if ! $tmux_unknown; then
+    tmux_features="$tmux_features:$1"
+  fi
+}
+
+# image $1 at the cursor. It goes between saving the cursor (ESC 7) and
+# restoring it (ESC 8), in the same wrapped piece, so that the cursor ends up
+# where tmux and screen think it is
+image() {
+  if [[ $mux == tmux ]]; then
+    # tmux writes a passthrough wherever your terminal's cursor happens to
+    # be, ahead of any text it hasn't drawn yet. A pause lets it draw the
+    # text and put the cursor back where the pane's cursor is
+    sleep 0.05
+  fi
+  wrap $'\e7'"$1"$'\e8'
+}
+
+# one of each feature, to see which arrive. Clipboard copies, links and
+# colour go unwrapped, as most programs send them: tmux handles those itself,
+# so this tests its settings too. Notifications and images go wrapped, as
+# tmux and screen drop them otherwise. Everything is written to the terminal
+run_tests() {
+  local b64 i r b
+  # a 1x1 red PNG, for the iTerm2 protocol
+  local png=iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAIAAACQd1PeAAAADElEQVR4nGP4z8AAAAMBAQDJ/pLvAAAAAElFTkSuQmCC
+
+  printf '\nTests: sent one of each to your terminal. Look for:\n'
+
+  b64=$(printf 'termcheck clipboard test' | base64 | tr -d '\n')
+  if [[ $mux == screen ]]; then
+    wrap $'\e]52;c;'"$b64"$'\a'
+  else
+    printf '\e]52;c;%s\a' "$b64"
+  fi
+  printf '  clipboard      paste somewhere: "termcheck clipboard test"\n'
+
+  wrap $'\e]9;termcheck: OSC 9 works\a'
+  wrap $'\e]777;notify;termcheck;OSC 777 works\a'
+  wrap $'\e]99;;termcheck: OSC 99 works\a'
+  printf '  notifications  one for each kind your terminal shows:\n'
+  printf '                 "OSC 9 works", "OSC 777 works", "OSC 99 works"\n'
+
+  printf '  images         a red bar after each protocol your terminal shows:\n'
+  printf '                   kitty   '
+  image $'\e_Ga=T,f=24,s=1,v=1,c=12,r=1,C=1,q=2;/wAA\e\\'
+  printf '\n                   iTerm2  '
+  image $'\e]1337;File=inline=1;width=12;height=1;preserveAspectRatio=0:'"$png"$'\a'
+  # sixel: 120x12 pixels, two bands of six
+  printf '\n                   sixel   '
+  if [[ -n $da1 ]] && ! $sixel; then
+    # a terminal without sixel may print the image as text
+    printf '(not sent: your terminal says it has no sixel)'
+  else
+    image $'\ePq"1;1;120;12#1;2;100;0;0#1!120~-!120~\e\\'
+  fi
+  printf '\n'
+
+  printf '  link           this should be a link: '
+  printf '\e]8;;https://example.com/\e\\termcheck link test\e]8;;\e\\\n'
+
+  printf '  colour         one smooth band, without steps: '
+  for (( i = 0; i < 40; i++ )); do
+    r=$(( 255 - i * 255 / 39 ))
+    b=$(( i * 255 / 39 ))
+    printf '\e[48;2;%d;40;%dm ' "$r" "$b"
+  done
+  printf '\e[m\n'
+}
+
+tests=false
+verbose=false
+while getopts ':tvh' opt; do
+  case $opt in
+    t) tests=true ;;
+    v) verbose=true ;;
+    h) usage; exit 0 ;;
+    *) usage >&2; exit 2 ;;
+  esac
+done
+shift $((OPTIND - 1))
+if (( $# > 0 )); then
+  usage >&2
+  exit 2
+fi
+
+tty_ok=false
+if { : > /dev/tty; } 2> /dev/null; then
+  tty_ok=true
+  exec 3> /dev/tty
+fi
+if $tests && ! $tty_ok; then
+  warn "-t needs a terminal; run termcheck in an interactive session"
+  exit 1
+fi
+
+tty_state=
+cleanup() {
+  if [[ -n $tty_state ]]; then
+    stty "$tty_state" < /dev/tty 2> /dev/null || true
+  fi
+}
+trap cleanup EXIT
+trap 'exit 129' HUP
+trap 'exit 130' INT
+trap 'exit 143' TERM
+
+# --- where this shell runs --------------------------------------------------
+
+nested=false
+if [[ -n ${TMUX:-} && -n ${STY:-} ]]; then
+  # tmux started from screen, or the other way round, or a variable left
+  # over: the nearest one above this shell is the inner one
+  nested=true
+  mux=$(mux_above $$)
+  [[ -n $mux ]] || mux=tmux
+elif [[ -n ${TMUX:-} ]]; then
+  mux=tmux
+elif [[ -n ${STY:-} ]]; then
+  mux=screen
+else
+  mux=
+fi
+
+# tmux's view of your terminal. Formats that a tmux version doesn't have come
+# out empty: client_termfeatures arrived in 3.2, client_termtype and
+# allow-passthrough in 3.3
+tmux_version='' termtype='' termname='' features='' passthrough='' clipboard_opt=''
+client_pid='' overrides='' clients=0
+tmux_unknown=false
+if [[ $mux == tmux ]] && ! have tmux; then
+  tmux_unknown=true
+elif [[ $mux == tmux ]]; then
+  IFS='|' read -r tmux_version termtype termname features passthrough client_pid < <(
+    tmux display -p ${TMUX_PANE:+-t "$TMUX_PANE"} \
+      '#{version}|#{client_termtype}|#{client_termname}|#{client_termfeatures}|#{allow-passthrough}|#{client_pid}' \
+      2> /dev/null) || true
+  if [[ -z $tmux_version ]]; then
+    tmux_version=$(tmux -V 2> /dev/null | sed 's/^tmux //') || true
+  fi
+  clipboard_opt=$(tmux show -sv set-clipboard 2> /dev/null) || true
+  overrides=$(tmux show -sv terminal-overrides 2> /dev/null | tr '\n' ' ') || true
+  session=$(tmux display -p ${TMUX_PANE:+-t "$TMUX_PANE"} '#{session_id}' 2> /dev/null) || true
+  if [[ -n $session ]]; then
+    clients=$(tmux list-clients -t "$session" 2> /dev/null | wc -l) || true
+    clients=$((clients))
+  fi
+fi
+
+screen_version=
+if [[ $mux == screen ]] && have screen; then
+  screen_version=$(screen -v 2> /dev/null | grep -Eo '[0-9]+\.[0-9]+(\.[0-9]+)?' | head -n 1) || true
+fi
+
+# how you're connected: from the processes above this shell, or inside tmux,
+# above the tmux client you're using. Inside screen there's no telling
+# which screen client is yours
+link=
+if [[ $mux == tmux && -n $client_pid ]]; then
+  link=$(link_of "$client_pid")
+elif [[ -z $mux ]]; then
+  link=$(link_of $$)
+fi
+mosh_version=
+if [[ $link == mosh* ]]; then
+  # "mosh-server (mosh 1.4.0) [build mosh 1.4.0]", from the running one, or
+  # failing that the one on PATH
+  mosh_version=$( { "/proc/${link#mosh }/exe" --version; mosh-server --version; } 2>&1 \
+    | grep -Eo 'mosh [0-9]+\.[0-9]+(\.[0-9]+)?' | head -n 1) || true
+  mosh_version=${mosh_version#mosh }
+  link=mosh
+fi
+
+# --- ask the terminal -------------------------------------------------------
+
+asked=false answers='' xtversion='' kitty_images=false kitty_notify=false
+sixel=false pixels='' da1=''
+why_not_asked=
+if ! $tty_ok; then
+  why_not_asked="there's no terminal here to ask; run termcheck in an interactive session"
+elif [[ $link == mosh ]]; then
+  why_not_asked="mosh answers questions itself, so your terminal can't be asked"
+elif [[ $mux == tmux ]] && ! have tmux; then
+  why_not_asked="\$TMUX is set but tmux isn't on PATH"
+elif [[ $mux == tmux && $passthrough == off ]]; then
+  why_not_asked="tmux's allow-passthrough is off, so the questions can't get past tmux"
+elif $nested; then
+  why_not_asked="tmux and screen are both in the way"
+else
+  ask_terminal
+  if [[ -z $answers ]]; then
+    why_not_asked="it didn't answer"
+  fi
+fi
+
+# --- which terminal ---------------------------------------------------------
+
+# the names it goes by, each with where it came from, the most reliable first
+names=()
+[[ -n $xtversion ]] && names+=("$xtversion|its answer to XTVERSION")
+[[ -n $termtype ]] && names+=("$termtype|tmux's client_termtype")
+[[ -n ${LC_TERMINAL:-} ]] && names+=("$LC_TERMINAL|\$LC_TERMINAL")
+if [[ -n ${TERM_PROGRAM:-} && $TERM_PROGRAM != tmux ]]; then
+  names+=("$TERM_PROGRAM|\$TERM_PROGRAM")
+fi
+[[ -n $termname ]] && names+=("$termname|tmux's client_termname")
+[[ -z $mux && -n ${TERM:-} ]] && names+=("$TERM|\$TERM")
+
+terminal='' terminal_from='' terminal_raw=''
+for entry in ${names[@]+"${names[@]}"}; do
+  terminal=$(terminal_of "${entry%%|*}")
+  if [[ -n $terminal ]]; then
+    terminal_raw=${entry%%|*}
+    terminal_from=${entry#*|}
+    break
+  fi
+done
+# the PuTTY family gives no name, but answers DA1 as a VT102, which few
+# others do. The Linux console answers the same, with TERM=linux
+if [[ -z $terminal && $da1 == 6 ]] && ! [[ -z $mux && ${TERM:-} == linux ]]; then
+  terminal='PuTTY, KiTTY or MobaXterm'
+  terminal_raw=$terminal
+  terminal_from="its answer to DA1 (a VT102, as PuTTY's is)"
+fi
+known_terminal "$terminal"
+# what it said about itself counts more than the table
+if $kitty_images; then t_images=$(with_word "$t_images" kitty); fi
+if $sixel; then
+  t_images=$(with_word "$t_images" sixel)
+elif [[ -n $da1 ]]; then
+  # terminals with sixel say so in their DA1 answer, so one without it has
+  # sixel switched off, or none. (Not every kitty-protocol terminal answers
+  # the kitty query, so for that the table stands)
+  t_images=$(printf ' %s ' "$t_images" | sed 's/ sixel / /; s/^ *//; s/ *$//')
+fi
+if $kitty_notify; then t_notify=$(with_word "$t_notify" 99); fi
+# outside tmux and screen, COLORTERM may say so
+if [[ -z $mux && ${COLORTERM:-} =~ ^(truecolor|24bit)$ && $t_rgb == '?' ]]; then
+  t_rgb=yes
+fi
+
+# --- report -----------------------------------------------------------------
+
+need_fix=false
+tmux_lines=()
+tmux_features=''
+fixes=()
+notes=()
+
+echo "Connection"
+case $link in
+  ssh)   echo "  ok:    over SSH" ;;
+  mosh)  echo "  ok:    over mosh${mosh_version:+ $mosh_version}" ;;
+  local) echo "  ok:    no SSH or mosh connection found: a terminal on this machine, or a kind of connection termcheck doesn't recognise" ;;
+  *)
+    if [[ -n ${SSH_CONNECTION:-} ]]; then
+      echo "  ok:    over SSH, going by \$SSH_CONNECTION${mux:+ (set when the $mux session started)}"
+    else
+      echo "  note:  can't tell how you're connected"
+    fi
+    ;;
+esac
+case $mux in
+  tmux)
+    if ! have tmux; then
+      echo "  WARN:  \$TMUX is set but tmux isn't on PATH, so termcheck can't read its settings"
+    else
+      line="tmux $tmux_version"
+      if at_least "$tmux_version" 3 3; then
+        line="$line, allow-passthrough $passthrough"
+      fi
+      echo "  ok:    $line, set-clipboard $clipboard_opt"
+      if (( clients > 1 )); then
+        echo "  note:  $clients terminals are attached to this tmux session; this checks the one you used last"
+      fi
+    fi
+    ;;
+  screen)
+    echo "  ok:    GNU screen${screen_version:+ $screen_version}"
+    ;;
+esac
+if $nested; then
+  echo "  WARN:  both \$TMUX and \$STY are set: tmux and screen inside one another, or one left over. termcheck checks $mux only"
+fi
+
+echo
+echo "Terminal"
+if [[ -n $terminal ]]; then
+  if [[ $terminal_raw == "$terminal" ]]; then
+    echo "  ok:    $terminal, from $terminal_from"
+  else
+    echo "  ok:    $terminal, from $terminal_from: $terminal_raw"
+  fi
+elif [[ -n $xtversion || -n $termtype ]]; then
+  echo "  note:  ${xtversion:-$termtype}, which termcheck doesn't know: going by what it answered"
+elif [[ -n $answers ]]; then
+  echo "  note:  termcheck can't tell which terminal this is: going by what it answered"
+else
+  echo "  note:  termcheck can't tell which terminal this is"
+fi
+if $asked; then
+  through=
+  case $mux in
+    tmux)   through=', asked through tmux' ;;
+    screen) through=', asked through screen' ;;
+  esac
+  if [[ -n $answers ]]; then
+    detail="kitty images: $($kitty_images && echo yes || echo no)"
+    detail="$detail; sixel: $($sixel && echo yes || echo no)"
+    detail="$detail; kitty notifications: $($kitty_notify && echo yes || echo no)"
+    [[ -n $pixels ]] && detail="$detail; ${pixels} pixels"
+    echo "  ok:    it answered$through: $detail"
+  else
+    echo "  note:  it didn't answer in 2 seconds$through"
+  fi
+  if $verbose; then
+    echo "  note:  its answers: $(printf '%s' "${answers:-nothing}" | cat -v)"
+  fi
+elif [[ -n $why_not_asked ]]; then
+  echo "  note:  not asked: $why_not_asked"
+fi
+if [[ -n $t_setup ]]; then
+  echo "  note:  $terminal: $t_setup"
+fi
+
+# the terminfo entry: programs here look up $TERM in it
+layout=note
+if [[ -z ${TERM:-} ]]; then
+  echo "  WARN:  \$TERM isn't set"
+else
+  file=$(terminfo_file "$TERM")
+  if have infocmp; then
+    found=$(infocmp "$TERM" > /dev/null 2>&1 && echo true || echo false)
+  else
+    found=$([[ -n $file ]] && echo true || echo false)
+  fi
+  if $found; then
+    echo "  ok:    TERM=$TERM, terminfo entry ${file:-found by infocmp}"
+  elif [[ -n $file ]]; then
+    # e.g. only under ~/.terminfo/78/, where this system's ncurses doesn't
+    # look: the layout fix below then belongs under "To fix"
+    echo "  WARN:  TERM=$TERM: there's an entry in $file, but infocmp can't read it"
+    need_fix=true
+    layout=fix
+  else
+    echo "  WARN:  TERM=$TERM, which has no terminfo entry here"
+    need_fix=true
+    if [[ $mux == tmux ]]; then
+      fixes+=("tmux sets TERM=$TERM (its default-terminal), which this machine has no terminfo entry for. Add to ~/.tmux.conf, then open a new tmux window:
+      set -g default-terminal screen-256color")
+    else
+      fixes+=("Copy the terminfo entry for $TERM here. On your own machine, in the same terminal:
+      infocmp -a $TERM | ssh ${HOSTNAME%%.*} tic -x -o \\~/.terminfo /dev/stdin")
+    fi
+  fi
+  # ncurses keeps an entry in a directory named after its first letter
+  # (x/xterm-kitty), or after that letter's hex code (78/xterm-kitty) in
+  # builds such as conda-forge's current one. A program built against one
+  # doesn't find entries that another one's tic wrote
+  printf -v hex '%x' "'${TERM:0:1}"
+  letter=${TERM:0:1}
+  text=''
+  # it matters only where ~/.terminfo has the one copy: a program built
+  # against conda's ncurses still finds the standard entries in conda's own
+  # terminfo directory
+  system_copy=false
+  for dir in /etc/terminfo /lib/terminfo /usr/share/terminfo /usr/lib/terminfo; do
+    if [[ -f $dir/$letter/$TERM || -f $dir/$hex/$TERM ]]; then
+      system_copy=true
+    fi
+  done
+  if $system_copy; then
+    :
+  elif [[ -f $HOME/.terminfo/$letter/$TERM && ! -e $HOME/.terminfo/$hex/$TERM ]]; then
+    text="~/.terminfo has $TERM under $letter/ only, and programs built against some ncurses builds, such as conda-forge's, look under $hex/. Link it there too:
+      mkdir -p ~/.terminfo/$hex && ln -s ../$letter/$TERM ~/.terminfo/$hex/$TERM"
+  elif [[ -f $HOME/.terminfo/$hex/$TERM && ! -e $HOME/.terminfo/$letter/$TERM ]]; then
+    text="~/.terminfo has $TERM under $hex/ only, and programs built against most ncurses builds, the system's included, look under $letter/. Link it there too:
+      mkdir -p ~/.terminfo/$letter && ln -s ../$hex/$TERM ~/.terminfo/$letter/$TERM"
+  fi
+  if [[ -n $text && $layout == fix ]]; then
+    fixes+=("$text")
+  elif [[ -n $text ]]; then
+    notes+=("$text")
+  fi
+fi
+if [[ $mux == tmux && -n $termname ]]; then
+  echo "  ok:    your terminal's TERM, outside tmux: $termname"
+fi
+
+echo
+echo "Features"
+printf '  %-15s %-6s %s\n' Feature Status Detail
+
+# where tmux needs telling what your terminal has, these are the lines
+term_pattern=${termname:-${TERM:-xterm-256color}}
+has_feature() { [[ ",$features," == *",$1,"* ]]; }
+
+# --- clipboard
+status=ok detail=
+case $link in
+  mosh)
+    if at_least "${mosh_version:-1.4}" 1 3; then
+      detail='mosh passes it on'
+    else
+      status=no detail="mosh $mosh_version drops it: mosh 1.3 and later pass it on"
+    fi
+    ;;
+esac
+if [[ $status == ok ]]; then
+  case $mux in
+    tmux)
+      if [[ $clipboard_opt != on ]]; then
+        status=fix detail="tmux ignores programs' copies (set-clipboard ${clipboard_opt:-?})"
+        tmux_fix 'set -g set-clipboard on'
+      elif at_least "$tmux_version" 3 2 && ! has_feature clipboard; then
+        status=fix detail="tmux doesn't know your terminal takes copies"
+        tmux_feature clipboard
+      else
+        detail="${detail:+$detail; }tmux passes it on"
+      fi
+      ;;
+    screen) detail='through screen, only from programs that wrap it' ;;
+  esac
+fi
+case $t_clip in
+  no)      status=no detail="${terminal:-your terminal} doesn't take clipboard copies" ;;
+  setting) [[ $status == ok ]] && status='?' detail="if switched on in $terminal (see Terminal above)" ;;
+  '?')     [[ $status == ok ]] && status='?' detail=${t_clip_detail:-"can't tell if your terminal takes them; try -t"} ;;
+esac
+row 'clipboard' "$status" "$detail"
+
+# --- notifications and images: tmux and screen drop both unless they're
+# wrapped, which for tmux needs allow-passthrough (always on before 3.3)
+pass_status=ok pass_detail=
+if [[ $link == mosh ]]; then
+  pass_status=no pass_detail='mosh drops them'
+elif [[ $mux == tmux ]]; then
+  if at_least "$tmux_version" 3 3 && [[ $passthrough != on && $passthrough != all ]]; then
+    pass_status=fix pass_detail="tmux drops them, and allow-passthrough is ${passthrough:-off}"
+  else
+    pass_status=ok pass_detail='through tmux, only from programs that wrap them'
+  fi
+elif [[ $mux == screen ]]; then
+  pass_detail='through screen, only from programs that wrap them'
+fi
+
+status=$pass_status detail=$pass_detail
+if [[ $t_notify == '?' ]]; then
+  [[ $status == ok ]] && status='?' detail="can't tell which your terminal shows; try -t"
+elif [[ -z $t_notify ]]; then
+  status=no detail="${terminal:-your terminal} doesn't show them; the bell may do instead"
+elif [[ $status == ok ]]; then
+  detail="$(osc_list "$t_notify")${detail:+; $detail}"
+fi
+[[ $status == fix ]] && tmux_fix 'set -g allow-passthrough on'
+row 'notifications' "$status" "$detail"
+
+status=$pass_status detail=$pass_detail
+if [[ $t_images == '?' ]]; then
+  if [[ $status == ok ]]; then
+    status='?'
+    if [[ -n $answers ]]; then
+      detail="not the kitty protocol or sixel; the iTerm2 protocol can't be asked about: try -t"
+    else
+      detail="can't tell which your terminal shows; try -t"
+    fi
+  fi
+elif [[ -z $t_images ]]; then
+  status=no detail="${terminal:-your terminal} doesn't show images"
+elif [[ $status == ok ]]; then
+  detail="$(image_list "$t_images")${detail:+; $detail}"
+  if [[ $mux == tmux ]] && ! at_least "$tmux_version" 3 3; then
+    detail="$detail; tmux before 3.3 can drop large ones"
+  fi
+fi
+[[ $status == fix ]] && tmux_fix 'set -g allow-passthrough on'
+row 'images' "$status" "$detail"
+
+# --- links
+status=ok detail=
+if [[ $link == mosh ]]; then
+  # mosh's code has them since 2026, after its latest release, 1.4.0
+  if at_least "${mosh_version:-1.4}" 1 5; then
+    status='?' detail="mosh $mosh_version may pass them on"
+  else
+    status=no detail="mosh ${mosh_version:-1.4} drops them"
+  fi
+elif [[ $mux == tmux ]]; then
+  if ! at_least "$tmux_version" 3 4; then
+    status=no detail="tmux before 3.4 drops them"
+  elif ! has_feature hyperlinks; then
+    status=fix detail="tmux doesn't know your terminal has them"
+  else
+    detail='tmux passes them on'
+  fi
+elif [[ $mux == screen ]]; then
+  status=no detail='screen drops them'
+fi
+case $t_link in
+  no)  status=no detail="${terminal:-your terminal} doesn't show them" ;;
+  '?') [[ $status == ok ]] && status='?' detail="can't tell if your terminal shows them; try -t" ;;
+esac
+[[ $status == fix ]] && tmux_feature hyperlinks
+row 'links' "$status" "$detail"
+
+# --- 24-bit colour
+status=ok detail=
+if [[ $link == mosh ]]; then
+  if at_least "${mosh_version:-1.4}" 1 4; then
+    detail='mosh passes it on'
+  else
+    status=no detail="mosh $mosh_version has 256 colours: mosh 1.4 and later have 24-bit"
+  fi
+fi
+if [[ $status == ok && $mux == tmux ]]; then
+  if at_least "$tmux_version" 3 2; then
+    if has_feature RGB; then
+      detail="${detail:+$detail; }tmux passes it on"
+    else
+      status=fix detail="tmux doesn't know your terminal has it, and shows 256 colours"
+      tmux_feature RGB
+    fi
+  elif [[ $overrides == *:Tc* || $overrides == *:RGB* ]]; then
+    detail="${detail:+$detail; }tmux passes it on"
+  else
+    status=fix detail="tmux doesn't know your terminal has it, and shows 256 colours"
+    tmux_fix "set -as terminal-overrides ',$term_pattern:Tc'"
+  fi
+elif [[ $status == ok && $mux == screen ]]; then
+  if [[ -n $screen_version ]] && ! at_least "$screen_version" 5 0; then
+    status=no detail="screen $screen_version has 256 colours: screen 5 has 24-bit"
+  elif grep -qsE '^[[:space:]]*truecolor[[:space:]]+on' "$HOME/.screenrc"; then
+    detail="screen passes it on (truecolor on)"
+  else
+    status=fix detail="screen shows 256 colours until truecolor is on"
+    fixes+=("Add to ~/.screenrc, then start a new screen session:
+      truecolor on")
+  fi
+fi
+case $t_rgb in
+  no)  status=no detail="${terminal:-your terminal} has 256 colours" ;;
+  '?') [[ $status == ok ]] && status='?' detail="can't tell if your terminal has it; try -t" ;;
+esac
+row '24-bit colour' "$status" "$detail"
+# programs here go by COLORTERM, which SSH doesn't pass on. tmux 3.6 and
+# later set it in its panes
+if [[ -z $t_images && -n ${DISPLAY:-} && $link != local ]]; then
+  text="X11 forwarding looks on (DISPLAY=$DISPLAY)"
+  if [[ -n $mux ]]; then
+    text="$text, though in $mux it dates from when the session started"
+  fi
+  notes+=("$text: graphical programs here, such as R's x11() device or ImageMagick's display, open windows on your machine, if it runs an X server (MobaXterm has one built in)")
+fi
+if [[ $t_rgb == yes && ! ${COLORTERM:-} =~ ^(truecolor|24bit)$ && $status != no ]]; then
+  notes+=("COLORTERM isn't set here, so some programs stick to 256 colours. If all your terminals have 24-bit colour, add to your shell's startup file: export COLORTERM=truecolor")
+fi
+
+if [[ -n $tmux_features ]]; then
+  tmux_fix "set -as terminal-features ',$term_pattern$tmux_features'"
+fi
+if (( ${#tmux_lines[@]} > 0 )); then
+  conf='~/.tmux.conf'
+  if [[ ! -f $HOME/.tmux.conf && -f ${XDG_CONFIG_HOME:-$HOME/.config}/tmux/tmux.conf ]]; then
+    conf='~/.config/tmux/tmux.conf'
+  fi
+  text="Add to $conf:$(printf '\n      %s' "${tmux_lines[@]}")
+    Then run 'tmux source-file $conf'"
+  if [[ ${tmux_lines[*]} == *terminal-* ]]; then
+    # tmux works out what a terminal has when it attaches
+    text="$text, then detach and reattach"
+  fi
+  fixes+=("$text")
+fi
+
+if (( ${#fixes[@]} > 0 )); then
+  echo
+  echo "To fix"
+  for f in "${fixes[@]}"; do
+    printf '  - %s\n' "$f"
+  done
+fi
+if (( ${#notes[@]} > 0 )); then
+  echo
+  echo "Notes"
+  for n in "${notes[@]}"; do
+    printf '  - %s\n' "$n"
+  done
+fi
+
+if $tests; then
+  run_tests >&3
+fi
+
+if $need_fix; then
+  exit 1
+fi
