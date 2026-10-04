@@ -101,7 +101,8 @@ notifications, images, links (OSC 8) and 24-bit colour. Says what to change
 where something doesn't get through.
 
   -t   also send a test of each feature, to see which ones arrive. This
-       copies a line of text to your clipboard
+       copies a line of text to your clipboard. Inside tmux or screen, it
+       then waits for Enter to remove the kitty image
   -v   also show your terminal's answers, as they arrived
   -h   show this help
 
@@ -397,6 +398,14 @@ ignores it, but one without sixel may print the sixel test as text. So where
 the terminal's DA1 answer says it has no sixel, `termcheck` doesn't send that
 test, and says so.
 
+Inside tmux or screen, the kitty image doesn't go away by itself. tmux and
+screen don't know it's there, so it stays where it was drawn when they scroll
+or clear the screen. Warp, for one, keeps it there until it's deleted or you
+leave tmux or screen. So where your terminal said it shows kitty images,
+`termcheck -t` ends by waiting for Enter (or Ctrl-C), then deletes the image.
+The iTerm2 protocol has no way to delete an image, so `termcheck` can't remove
+that one.
+
 ---
 
 ## Limitations
@@ -549,6 +558,10 @@ Also tested:
   arrived whole and unwrapped. Through tmux the link and the 24-bit colours
   came through, and through screen the colours were turned into basic ones.
   Through tmux, each image followed its label, in three runs out of three.
+  Through screen 5.0.2 (with and without `truecolor on`) and tmux 3.7, the
+  Warp stand-in got the prompt, then the kitty image's delete command after
+  Enter, and after Ctrl-C (exit status 130). With no multiplexer there was no
+  prompt.
 - **Fixes.** A missing terminfo entry (`TERM=foot`) gave the `tic` command; an
   entry only under `~/.terminfo/78/` gave a warning and the link, and the link
   made `infocmp` find it; an entry only under `x/` gave a note; a damaged

@@ -28,7 +28,8 @@ notifications, images, links (OSC 8) and 24-bit colour. Says what to change
 where something doesn't get through.
 
   -t   also send a test of each feature, to see which ones arrive. This
-       copies a line of text to your clipboard
+       copies a line of text to your clipboard. Inside tmux or screen, it
+       then waits for Enter to remove the kitty image
   -v   also show your terminal's answers, as they arrived
   -h   show this help
 
@@ -343,6 +344,18 @@ image() {
   wrap $'\e7'"$1"$'\e8'
 }
 
+# the -t kitty image's id: termcheck's own, so that deleting it leaves other
+# images alone
+test_image_id=31337
+
+# delete the -t kitty image, if it's still on screen
+remove_test_image() {
+  if $test_image_shown; then
+    wrap $'\e_Ga=d,d=I,i='"$test_image_id"$',q=2\e\\' >&3
+    test_image_shown=false
+  fi
+}
+
 # one of each feature, to see which arrive. Clipboard copies, links and
 # colour go unwrapped, as most programs send them: tmux handles those itself,
 # so this tests its settings too. Notifications and images go wrapped, as
@@ -370,7 +383,7 @@ run_tests() {
 
   printf '  images         a red bar after each protocol your terminal shows:\n'
   printf '                   kitty   '
-  image $'\e_Ga=T,f=24,s=1,v=1,c=12,r=1,C=1,q=2;/wAA\e\\'
+  image $'\e_Ga=T,f=24,s=1,v=1,c=12,r=1,C=1,q=2,i='"$test_image_id"$';/wAA\e\\'
   printf '\n                   iTerm2  '
   image $'\e]1337;File=inline=1;width=12;height=1;preserveAspectRatio=0:'"$png"$'\a'
   # sixel: 120x12 pixels, two bands of six
@@ -393,6 +406,16 @@ run_tests() {
     printf '\e[48;2;%d;40;%dm ' "$r" "$b"
   done
   printf '\e[m\n'
+
+  # tmux and screen don't know the kitty image is there, so it stays put when
+  # they scroll or clear the screen: in Warp, until it's deleted. So once
+  # you've seen it, delete it
+  if [[ $mux == tmux || $mux == screen ]] && $kitty_images; then
+    test_image_shown=true
+    printf '\nPress Enter to remove the kitty image (%s can'\''t clear it away) ' "$mux"
+    read -r _ < /dev/tty || true
+    remove_test_image
+  fi
 }
 
 tests=false
@@ -422,10 +445,13 @@ if $tests && ! $tty_ok; then
 fi
 
 tty_state=
+test_image_shown=false
 cleanup() {
   if [[ -n $tty_state ]]; then
     stty "$tty_state" < /dev/tty 2> /dev/null || true
   fi
+  # Ctrl-C at the -t prompt still removes the image
+  remove_test_image
 }
 trap cleanup EXIT
 trap 'exit 129' HUP
