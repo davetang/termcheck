@@ -244,6 +244,10 @@ set -as terminal-overrides ',xterm-256color:Tc'
 `-a` appends to the list, so sourcing the file twice adds the entry twice,
 which does no harm.
 
+Where there's no `~/.tmux.conf` but there is a `$XDG_CONFIG_HOME/tmux/tmux.conf`
+or `~/.config/tmux/tmux.conf`, which tmux also reads, `termcheck` names that
+file instead.
+
 If the terminfo entry for tmux's own `TERM` (its `default-terminal`, such as
 `tmux-256color`) is missing, `termcheck` suggests `set -g default-terminal
 screen-256color`, which nearly every system has.
@@ -292,6 +296,12 @@ against Miniforge can't find an entry that the system's `tic` installed. Where
 mkdir -p ~/.terminfo/78 && ln -s ../x/xterm-kitty ~/.terminfo/78/xterm-kitty
 ```
 
+Where `infocmp` can't read the entry in either place, the file itself is
+damaged, or was written by a newer ncurses than this machine's (ncurses 6.1
+and later use a format older ones can't read for entries with large numbers,
+such as `xterm-direct`). Then `termcheck` suggests copying the entry over again
+with the `tic` command above, which compiles it with this machine's ncurses.
+
 ### COLORTERM
 
 ```sh
@@ -316,13 +326,13 @@ terminals themselves:
 | Terminal | Clipboard copies | Notifications | Images | Links | 24-bit colour | To switch on |
 | --- | --- | --- | --- | --- | --- | --- |
 | Warp | yes | OSC 9, OSC 777 | kitty | yes | yes | Notifications: Settings > Features > Notifications > "Receive desktop notifications" |
-| kitty | yes | OSC 99 | kitty | yes | yes | |
+| kitty | yes | OSC 9, OSC 99 | kitty | yes | yes | |
 | Ghostty | yes | OSC 9, OSC 777 | kitty | yes | yes | |
 | iTerm2 | if switched on | OSC 9 | iTerm2, sixel | yes | yes | Clipboard: Settings > General > Selection > "Applications in terminal may access clipboard". Notifications: Settings > Profiles > Terminal |
 | WezTerm | yes | OSC 9, OSC 777 | iTerm2, sixel | yes | yes | |
 | foot | yes | OSC 777 | sixel | yes | yes | |
 | Alacritty | yes | none | none | yes | yes | |
-| Terminal.app | ? | none | none | ? | ? | |
+| Terminal.app | no | none | none | ? | ? | |
 | GNOME Terminal and other VTE terminals | no | ? | none | yes | yes | |
 | PuTTY, KiTTY, MobaXterm (recognised together, see below) | PuTTY, MobaXterm: no. KiTTY: yes | none | none | ? | yes | |
 
@@ -406,6 +416,10 @@ test, and says so.
   itself.
 - **tmux and screen inside one another** aren't checked: `termcheck` warns and
   checks the inner one.
+- **A tmux further out**, such as one on your own machine that you SSH from,
+  answers the questions itself, so `termcheck` can't tell which terminal you
+  use, and can't read that tmux's settings. It says so, and the rows are
+  mostly `?`. Run `termcheck` (and `-t`) in that tmux too.
 - **Several terminals attached to one tmux session.** `termcheck` checks the
   one you used last, but all of them may answer its questions; it reads the
   first answers.
@@ -429,6 +443,8 @@ test, and says so.
 | `WARN: TERM=..., which has no terminfo entry here` | A newer terminal whose entry this machine lacks | See [Terminfo](#terminfo) |
 | `ok` in the report, but nothing happens | A setting in the terminal itself (iTerm2's clipboard, Warp's notifications), or your desktop blocks the terminal's notifications | See the `note:` under **Terminal**, and [Your terminal](#your-terminal) |
 | Garbage printed during `-t` | The terminal printed a sequence it doesn't understand, such as sixel from a terminal that didn't answer DA1 | Harmless; `clear` |
+| `tmux 3.5a answered, not your terminal` | You run tmux on your own machine as well, or somewhere else between here and your terminal | Run `termcheck` in that tmux too. `-t` here shows what gets through both |
+| `WARN: can't read tmux's settings: tmux display failed: ...` | The `tmux` on `PATH` can't talk to the running server: "protocol version mismatch" means it's another version (say a conda tmux, and the system's running the server); "error connecting" means `$TMUX` is left over from a session that has gone | Run `termcheck` with the server's tmux first on `PATH`, or restart the server with the new tmux (`tmux kill-server` ends every session) |
 | `termcheck: command not found` | `~/bin` not on `PATH` yet | Open a new shell, or `source ~/.bashrc` (zsh: `~/.zshenv`) |
 
 ---
@@ -520,7 +536,7 @@ for the connection, since `termcheck` goes by process names.
 | Path | What was checked |
 | --- | --- |
 | No multiplexer | Each imitated terminal was recognised by its XTVERSION answer; kitty's image and notification answers, and foot's and WezTerm's sixel, were picked up; XTerm, the DA1-only and the silent terminal gave `?` rows, the silent one after 2 seconds |
-| tmux 3.7 | The questions went through passthrough and the answers came back (Warp, kitty, WezTerm). With only `allow-passthrough on`: `fix` for the clipboard (`set-clipboard external`), links and 24-bit colour, all three gone with the suggested lines. With `allow-passthrough off`: not asked, named from `#{client_termtype}`, and `fix` for notifications and images |
+| tmux 3.7 | The questions went through passthrough and the answers came back (Warp, kitty, WezTerm). With only `allow-passthrough on`: `fix` for the clipboard (`set-clipboard external`), links and 24-bit colour, all three gone with the suggested lines. With `allow-passthrough off`: not asked, named from `#{client_termtype}`, and `fix` for notifications and images. A VTE stand-in, which takes no clipboard copies: clipboard `no`, and no `set-clipboard` line. A stand-in answering as tmux 3.5a (a tmux on your own machine): reported as that, with `?` rows |
 | tmux 3.1 | Asked through passthrough (always on before 3.3); links `no`; 24-bit colour fixed with `terminal-overrides` |
 | GNU screen 4.8 | Asked through DCS wrapping; iTerm2 recognised by `$LC_TERMINAL`; links and 24-bit colour `no` |
 | GNU screen 5.0.2 (built from source) | Asked through DCS wrapping: the Warp and kitty stand-ins' answers came back intact, even when sent a byte at a time 50 ms apart. The PuTTY stand-in was recognised by its DA1 answer, and `-t` skipped the sixel test |
@@ -535,11 +551,12 @@ Also tested:
   Through tmux, each image followed its label, in three runs out of three.
 - **Fixes.** A missing terminfo entry (`TERM=foot`) gave the `tic` command; an
   entry only under `~/.terminfo/78/` gave a warning and the link, and the link
-  made `infocmp` find it; an entry only under `x/` gave a note. Entries that
-  the system also has gave nothing.
+  made `infocmp` find it; an entry only under `x/` gave a note; a damaged
+  entry gave the `tic` command, not a link. Entries that the system also has
+  gave nothing.
 - **Edge cases.** No terminal at all (run from a script without one, with and
-  without `-t`); `$TMUX` set with no tmux on `PATH`; `$TMUX` and `$STY` both
-  set; `TERM=linux` with a VT102 DA1 answer (not taken for PuTTY); bad
+  without `-t`); `$TMUX` set with no tmux on `PATH`, or naming a server
+  that has gone (tmux's error shown, `?` rows); `$TMUX` and `$STY` both set; `TERM=linux` with a VT102 DA1 answer (not taken for PuTTY); bad
   options. Ctrl-C while waiting for answers left echo on.
 - **`setup.sh`**, in a throwaway `HOME`: bash (with an early `return` in
   `.bashrc`) and zsh, a re-run without duplicate lines, another `termcheck`
